@@ -148,7 +148,8 @@ func buildQueryVariants(p AddressParts) []string {
 	out := []string{}
 	seen := map[string]bool{}
 	for _, v := range variants {
-		v = strings.TrimSpace(v)
+		// 异体字/别字归一后再查询（南斉院町→南斎院町），GSI对标准字形召回最准
+		v = canonicalTown(strings.TrimSpace(v))
 		if v == "" || seen[v] {
 			continue
 		}
@@ -257,17 +258,22 @@ func splitAddress(raw string) AddressParts {
 	p.Street, p.Number, p.Detail = splitStreetNumberDetail(s)
 	// 町名重复录入折叠（“緑ケ丘 緑ヶ丘”→“緑ヶ丘”），避免重复片段污染GSI查询导致召回降级
 	p.Street = dedupeStreet(p.Street)
+	// 跨字段重复：町名已在区/町村字段提取，街道中又残留一遍（常为别字异体，
+	// 如“南斎院町”入district、“南斉院町”留在street），清空街道重复避免污染查询
+	if p.District != "" && p.Street != "" && canonicalTown(p.District) == canonicalTown(p.Street) {
+		p.Street = ""
+	}
 	return p
 }
 
 // dedupeStreet 折叠街道中重复录入的町名。录入数据常把同一町名写两遍，
-// 且混用异体字（“緑ケ丘 緑ヶ丘”、无空格的“緑ヶ丘緑ヶ丘”）。
+// 且混用异体字/别字（“緑ケ丘 緑ヶ丘”“南斎院町南斉院町”、无空格整体重复）。
 func dedupeStreet(s string) string {
 	tokens := strings.Fields(s)
 	if len(tokens) >= 2 {
 		kept := make([]string, 0, len(tokens))
 		for _, t := range tokens {
-			if len(kept) > 0 && canonicalKe(kept[len(kept)-1]) == canonicalKe(t) {
+			if len(kept) > 0 && canonicalTown(kept[len(kept)-1]) == canonicalTown(t) {
 				continue
 			}
 			kept = append(kept, t)
@@ -277,16 +283,27 @@ func dedupeStreet(s string) string {
 	// 无空格整体重复：“緑ヶ丘緑ヶ丘”→“緑ヶ丘”
 	rs := []rune(s)
 	if n := len(rs); n >= 4 && n%2 == 0 {
-		if canonicalKe(string(rs[:n/2])) == canonicalKe(string(rs[n/2:])) {
+		if canonicalTown(string(rs[:n/2])) == canonicalTown(string(rs[n/2:])) {
 			s = string(rs[:n/2])
 		}
 	}
 	return strings.TrimSpace(s)
 }
 
-// canonicalKe 町名异体字归一：片假名“ケ”与小字“ヶ”为同一助词（緑ケ丘＝緑ヶ丘）
-func canonicalKe(s string) string {
-	return strings.ReplaceAll(s, "ケ", "ヶ")
+// townVariantMap 地名异体字/常见录入别字归一（映射到GSI采用的标准字形）
+var townVariantMap = map[rune]rune{
+	'ケ': 'ヶ', 'ヶ': 'ヶ', // 緑ケ丘＝緑ヶ丘（全角片假名/小字片假名）
+	'斉': '斎', '斎': '斎', // 南斉院町＝南斎院町（斎/斉录入混用，GSI标准字形为斎）
+}
+
+// canonicalTown 地名归一：异体字/常见别字统一为标准字形，用于重复折叠、查询与比对
+func canonicalTown(s string) string {
+	return strings.Map(func(r rune) rune {
+		if c, ok := townVariantMap[r]; ok {
+			return c
+		}
+		return r
+	}, s)
 }
 
 // earliestSuffixBeforeDigit 在第一个数字之前，寻找最早出现的后缀，返回含后缀的完整片段
@@ -367,8 +384,8 @@ func normalizeAddr(s string) string {
 	}
 	s = normalizeDashes(b.String())
 	s = spaceRe.ReplaceAllString(s, " ")
-	// 町名异体字归一：“緑ケ丘”与“緑ヶ丘”为同一地名（全角/小字片假名）
-	s = strings.ReplaceAll(s, "ケ", "ヶ")
+	// 地名异体字/别字归一（緑ケ丘→緑ヶ丘、南斉院町→南斎院町），查询与比对口径一致
+	s = canonicalTown(s)
 	return strings.TrimSpace(s)
 }
 
