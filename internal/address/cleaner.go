@@ -255,7 +255,38 @@ func splitAddress(raw string) AddressParts {
 		s = spaceRe.ReplaceAllString(strings.ReplaceAll(s, p.District, " "), " ")
 	}
 	p.Street, p.Number, p.Detail = splitStreetNumberDetail(s)
+	// 町名重复录入折叠（“緑ケ丘 緑ヶ丘”→“緑ヶ丘”），避免重复片段污染GSI查询导致召回降级
+	p.Street = dedupeStreet(p.Street)
 	return p
+}
+
+// dedupeStreet 折叠街道中重复录入的町名。录入数据常把同一町名写两遍，
+// 且混用异体字（“緑ケ丘 緑ヶ丘”、无空格的“緑ヶ丘緑ヶ丘”）。
+func dedupeStreet(s string) string {
+	tokens := strings.Fields(s)
+	if len(tokens) >= 2 {
+		kept := make([]string, 0, len(tokens))
+		for _, t := range tokens {
+			if len(kept) > 0 && canonicalKe(kept[len(kept)-1]) == canonicalKe(t) {
+				continue
+			}
+			kept = append(kept, t)
+		}
+		s = strings.Join(kept, " ")
+	}
+	// 无空格整体重复：“緑ヶ丘緑ヶ丘”→“緑ヶ丘”
+	rs := []rune(s)
+	if n := len(rs); n >= 4 && n%2 == 0 {
+		if canonicalKe(string(rs[:n/2])) == canonicalKe(string(rs[n/2:])) {
+			s = string(rs[:n/2])
+		}
+	}
+	return strings.TrimSpace(s)
+}
+
+// canonicalKe 町名异体字归一：片假名“ケ”与小字“ヶ”为同一助词（緑ケ丘＝緑ヶ丘）
+func canonicalKe(s string) string {
+	return strings.ReplaceAll(s, "ケ", "ヶ")
 }
 
 // earliestSuffixBeforeDigit 在第一个数字之前，寻找最早出现的后缀，返回含后缀的完整片段
@@ -336,6 +367,8 @@ func normalizeAddr(s string) string {
 	}
 	s = normalizeDashes(b.String())
 	s = spaceRe.ReplaceAllString(s, " ")
+	// 町名异体字归一：“緑ケ丘”与“緑ヶ丘”为同一地名（全角/小字片假名）
+	s = strings.ReplaceAll(s, "ケ", "ヶ")
 	return strings.TrimSpace(s)
 }
 
