@@ -2,3 +2,5 @@
 *.log
 /bin/
 .trae/
+# 密钥配置不入库
+.env

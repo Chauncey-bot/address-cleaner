@@ -28,6 +28,11 @@ var latinWordRe = regexp.MustCompile(`[A-Za-z]+`)
 // 末尾允许跟一个无后续数字的后缀（“1号”的“号”），避免残留为细节。
 var numSeqRe = regexp.MustCompile(`^\s*\d[\d\s]*(?:(?:丁目|番地|地割|番|号|条|[-－−])\s*\d[\d\s]*)*(?:丁目|番地|地割|番|号|条)?`)
 
+// kanjiNumStartRe 匹配以汉字数字开头的番号起点（“二丁目”“九八番地”“三号”“二番”）。
+// “X番町”（五番町/三番町）是地名而非番号，由 kanjiNumSeqStart 排除。
+// 不含“条”（“三条市”是市名）。
+var kanjiNumStartRe = regexp.MustCompile(`[一二三四五六七八九十百]+(?:丁目|番地|地割|号|番)`)
+
 // romajiSuffixMap 罗马字番号后缀 -> 日文
 var romajiSuffixMap = map[string]string{
 	"CHOUME": "丁目",
@@ -245,6 +250,10 @@ func splitAddress(raw string) AddressParts {
 	}
 
 	// 3. 街道 / 门牌号 / 细节
+	// 数据录入常把区名重复拼进街道（“緑区ほら貝緑区二丁目”），剥离残留区名避免污染查询
+	if p.District != "" {
+		s = spaceRe.ReplaceAllString(strings.ReplaceAll(s, p.District, " "), " ")
+	}
 	p.Street, p.Number, p.Detail = splitStreetNumberDetail(s)
 	return p
 }
@@ -272,15 +281,16 @@ func earliestSuffixBeforeDigit(s string, suffixes ...string) string {
 }
 
 // splitStreetNumberDetail 拆分街道（数字前）、门牌号（番号序列）、细节（番号后的楼名/房间号）。
-// 番号序列支持 “5丁目12番26号”“5-12-26”“201-118” 等形式，整体提取为 “5-12-26”；
-// 序列之后的数字（如 “318室”）属于细节，不计入门牌号。
+// 番号序列支持 “5丁目12番26号”“二丁目98番”“5-12-26”“201-118” 等形式，整体提取为 “5-12-26”；
+// 序列之后的内容（如 “池”“318室”）属于细节，不计入门牌号。
 func splitStreetNumberDetail(s string) (street, number, detail string) {
-	loc := numRe.FindStringIndex(s)
-	if loc == nil {
+	loc := numberSeqStart(s)
+	if loc < 0 {
 		return strings.TrimSpace(s), "", ""
 	}
-	street = strings.TrimSpace(s[:loc[0]])
-	tail := s[loc[0]:]
+	street = strings.TrimSpace(s[:loc])
+	// 汉字番号归一（二丁目→2丁目）后再提取序列
+	tail := normalizeChomeNumbers(s[loc:])
 	seq := numSeqRe.FindString(tail)
 	if seq == "" {
 		seq = numRe.FindString(tail)
@@ -288,6 +298,25 @@ func splitStreetNumberDetail(s string) (street, number, detail string) {
 	number = strings.Join(digitGroups(seq), "-")
 	detail = strings.TrimSpace(tail[len(seq):])
 	return
+}
+
+// numberSeqStart 返回番号序列的起始字节位置：
+// 取阿拉伯数字起点与“汉字数字+丁目/番/号”起点中较早者；“X番町”为地名需排除；无番号返回 -1。
+func numberSeqStart(s string) int {
+	best := -1
+	if loc := numRe.FindStringIndex(s); loc != nil {
+		best = loc[0]
+	}
+	for _, loc := range kanjiNumStartRe.FindAllStringIndex(s, -1) {
+		// “番”后紧跟“町”是地名（五番町/三番町），不是番号
+		if strings.HasPrefix(s[loc[1]:], "町") {
+			continue
+		}
+		if best == -1 || loc[0] < best {
+			best = loc[0]
+		}
+	}
+	return best
 }
 
 // normalizeAddr 规范化：罗马字番号转日文（5 CHOUME→5丁目）、
@@ -555,9 +584,16 @@ func isSameAddress(p AddressParts, gsi GSIQueryItem, mode string) AddressCompare
 	}
 
 	numScore := 0
+	numVerifiable := false
 	if p.Number != "" {
 		numScore = numberMatchScore(p.Number, nGsi)
 		score += numScore
+		// GSI标题含数字（番地级数据）时番号才可比对；
+		// 标题无数字说明GSI只到町名粒度，番号无法核验而非不一致
+		numVerifiable = numRe.MatchString(nGsi)
+		if !numVerifiable {
+			res.Items = append(res.Items, "number:GSI仅到町名粒度，番号无法核验")
+		}
 	}
 
 	// 街道为空（如“〇〇町1740-9”形式）时不阻断核心匹配，由区町村/门牌兜底
@@ -566,6 +602,10 @@ func isSameAddress(p AddressParts, gsi GSIQueryItem, mode string) AddressCompare
 	threshold := 80
 	if mode == "relaxed" {
 		threshold = 60
+	}
+	// 番号不可验证（输入无番号，或GSI仅到町名）时，番号权重不计入门槛
+	if p.Number == "" || !numVerifiable {
+		threshold -= 20
 	}
 	res.Score = score
 	res.Same = core && score >= threshold
@@ -609,7 +649,8 @@ func (ac *AddressCleaner) buildValidation(res *CleanResult, bestScore int, opt C
 
 	v.IsValid = v.Same && bestScore >= threshold
 
-	if opt.EnableAIAssist && ac.AIAssist != nil && v.Confidence == "low" && res.GSIAddress != "" {
+	// 中/低置信度且开启AI时用AI复核（边界案例最容易误判）；AI失败回退规则结论
+	if opt.EnableAIAssist && ac.AIAssist != nil && v.Confidence != "high" && res.GSIAddress != "" {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if aj, err := ac.AIAssist.Judge(ctx, res.Input, res.GSIAddress); err == nil && aj != nil {

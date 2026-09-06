@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bufio"
 	"log"
 	"net/http"
 	"os"
+	"strings"
 
 	"jp-address-cleaner/internal/address"
 	"jp-address-cleaner/internal/handler"
@@ -11,6 +13,8 @@ import (
 )
 
 func main() {
+	loadDotEnv(".env")
+
 	cleaner := address.NewCleaner()
 	// AI辅助复核为可选能力：配置了 AI_API_KEY 才启用
 	if key := os.Getenv("AI_API_KEY"); key != "" {
@@ -20,6 +24,7 @@ func main() {
 			getenv("AI_MODEL", "gpt-4o-mini"),
 			3000,
 		)
+		log.Printf("AI辅助复核已启用: base=%s model=%s", getenv("AI_BASE_URL", ""), getenv("AI_MODEL", ""))
 	}
 
 	h := handler.NewHandler(cleaner)
@@ -51,4 +56,34 @@ func getenv(k, def string) string {
 		return v
 	}
 	return def
+}
+
+// loadDotEnv 从 KEY=VALUE 格式的 .env 文件加载环境变量（文件不存在则跳过）。
+// 不覆盖已存在的环境变量，便于用真实环境变量覆盖配置。
+func loadDotEnv(path string) {
+	f, err := os.Open(path)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		k, v, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		k = strings.TrimSpace(k)
+		v = strings.TrimSpace(v)
+		v = strings.Trim(v, `"'`)
+		if k == "" {
+			continue
+		}
+		if _, exists := os.LookupEnv(k); !exists {
+			_ = os.Setenv(k, v)
+		}
+	}
 }

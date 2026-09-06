@@ -21,7 +21,7 @@ func NewHandler(c *address.AddressCleaner) *Handler {
 type CleanRequest struct {
 	Address        string `json:"address"`        // 原始地址
 	Mode           string `json:"mode"`           // strict / relaxed，默认strict
-	EnableAIAssist bool   `json:"enableAIAssist"` // 低置信度时是否启用AI复核
+	EnableAIAssist bool   `json:"enableAIAssist"` // 中/低置信度时是否启用AI复核
 }
 
 // CleanAddress 地址清洗接口
