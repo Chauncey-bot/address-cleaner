@@ -7,6 +7,7 @@ import (
 
 	"jp-address-cleaner/internal/address"
 	"jp-address-cleaner/internal/handler"
+	"jp-address-cleaner/internal/web"
 )
 
 func main() {
@@ -27,6 +28,15 @@ func main() {
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
+	})
+	// 清关数据 Excel 上传清洗页面
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write(web.IndexHTML)
 	})
 
 	addr := getenv("ADDR", ":8080")

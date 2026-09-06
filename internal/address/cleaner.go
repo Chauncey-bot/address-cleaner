@@ -16,6 +16,43 @@ import (
 var numRe = regexp.MustCompile(`\d+(?:-\d+)*`)
 var spaceRe = regexp.MustCompile(`\s+`)
 
+// romajiNumRe 匹配罗马字番号，如 “5 CHOUME/CHOME”“12-BAN”“26GOU”“1 JO”。
+// 长词需排在短词之前（CHOUME/BANCHI/GOU），避免短词抢先匹配。
+var romajiNumRe = regexp.MustCompile(`(?i)(\d{1,4})[\s\-－−]?(CHOUME|CHOME|BANCHI|BAN|GOU|GO|JO)\b`)
+
+// latinWordRe 匹配连续拉丁字母（用于 GSI 查询时去除罗马字，GSI 索引仅日文）
+var latinWordRe = regexp.MustCompile(`[A-Za-z]+`)
+
+// numSeqRe 匹配番号序列前缀：数字经 丁目/番地/番/号/条/地割/连字符 连接的整段，
+// 如 “5丁目 12番 26号”“2丁目8番1号”“1-12-23-102”“201-118”。
+// 末尾允许跟一个无后续数字的后缀（“1号”的“号”），避免残留为细节。
+var numSeqRe = regexp.MustCompile(`^\s*\d[\d\s]*(?:(?:丁目|番地|地割|番|号|条|[-－−])\s*\d[\d\s]*)*(?:丁目|番地|地割|番|号|条)?`)
+
+// romajiSuffixMap 罗马字番号后缀 -> 日文
+var romajiSuffixMap = map[string]string{
+	"CHOUME": "丁目",
+	"CHOME":  "丁目",
+	"BANCHI": "番地",
+	"BAN":    "番",
+	"GOU":    "号",
+	"GO":     "号",
+	"JO":     "条",
+}
+
+// chomeNumRe 匹配“汉字数字 + 地址号码后缀（丁目/番/号等）”，
+// 仅在号码后缀前转换汉字数字，避免误伤“三条市”“一条通”“三鷹”等地名。
+var chomeNumRe = regexp.MustCompile(`([一二三四五六七八九十百]+)(丁目|番町|番|号|地割)`)
+
+// sapporoJoRe 匹配札幌条丁目格式“北/南/東/西 + 汉字数字 + 条”（如北一条、南三条）。
+// 条后缀必须带方向前缀，以区别于“三条市”“一条通”等地名。
+var sapporoJoRe = regexp.MustCompile(`([南北東西])([一二三四五六七八九十百]+)条`)
+
+// kanjiDigitMap 简单汉字数字（地址番号级别最多到百）
+var kanjiDigitMap = map[rune]int{
+	'一': 1, '二': 2, '三': 3, '四': 4, '五': 5,
+	'六': 6, '七': 7, '八': 8, '九': 9, '十': 10, '百': 100,
+}
+
 // AddressCleaner 地址清洗器
 type AddressCleaner struct {
 	HTTPClient  *http.Client
@@ -45,8 +82,10 @@ func (ac *AddressCleaner) Clean(ctx context.Context, input string, opt CleanOpti
 
 	items, err := ac.queryWithFallback(ctx, res.Parts)
 	if err != nil {
+		// GSI 查询失败属于“该行无法核验”的业务结果而非服务错误：
+		// 返回结构化结果（isValid=false + 失败原因），保证前端无论是否匹配都能展示。
 		res.Validation = failValidation("GSI查询失败: " + err.Error())
-		return res, err
+		return res, nil
 	}
 	res.Candidates = items
 
@@ -61,15 +100,20 @@ func (ac *AddressCleaner) Clean(ctx context.Context, input string, opt CleanOpti
 	return res, nil
 }
 
-// queryWithFallback 多级查询降级：精确 -> 全文 -> 去门牌 -> 到区 -> 到市
+// queryWithFallback 多级查询降级：精确 -> 全文 -> 去门牌 -> 到区 -> 到市。
+// 单个变体请求失败（GSI 网络抖动/超时）时不中断，继续尝试后续变体；
+// 所有变体均失败才返回最后一个错误，避免一次瞬时抖动导致整行清洗失败。
 func (ac *AddressCleaner) queryWithFallback(ctx context.Context, p AddressParts) ([]GSIQueryItem, error) {
 	collected := []GSIQueryItem{}
 	seenItem := map[string]bool{}
+	var lastErr error
 	for _, q := range buildQueryVariants(p) {
 		items, err := ac.queryGSI(ctx, q)
 		if err != nil {
-			return collected, err
+			lastErr = err
+			continue
 		}
+		lastErr = nil
 		for _, it := range items {
 			if it.Title == "" || seenItem[it.Title] {
 				continue
@@ -81,14 +125,18 @@ func (ac *AddressCleaner) queryWithFallback(ctx context.Context, p AddressParts)
 			break
 		}
 	}
+	if len(collected) == 0 && lastErr != nil {
+		return collected, lastErr
+	}
 	return collected, nil
 }
 
 func buildQueryVariants(p AddressParts) []string {
+	// GSI 索引仅含日文，罗马字（地名/楼名/番号）会降级召回，查询词统一去除拉丁词
 	variants := []string{
-		composeQuery(p, true),
-		normalizeAddr(p.Raw),
-		composeQuery(p, false),
+		stripLatinForQuery(composeQuery(p, true)),
+		stripLatinForQuery(normalizeAddr(p.Raw)),
+		stripLatinForQuery(composeQuery(p, false)),
 		p.Province + p.City + p.District,
 		p.Province + p.City,
 	}
@@ -163,12 +211,22 @@ func splitAddress(raw string) AddressParts {
 		p.Province = "京都府"
 		s = s[len("京都府"):]
 	} else {
+		// 多个后缀均命中时取位置最早者，而非列表顺序：
+		// “愛知県大府市”的“府”在市名中，按列表顺序会误切为“愛知県大府”+“市”
+		bestIdx, bestEnd := -1, -1
 		for _, suf := range []string{"都", "道", "府", "県", "省", "州"} {
-			if idx := strings.Index(s, suf); idx >= 0 && idx <= 12 {
-				p.Province = s[:idx+len(suf)]
-				s = s[idx+len(suf):]
-				break
+			idx := strings.Index(s, suf)
+			if idx < 0 || idx > 12 {
+				continue
 			}
+			end := idx + len(suf)
+			if bestIdx == -1 || end < bestEnd {
+				bestIdx, bestEnd = idx, end
+			}
+		}
+		if bestIdx >= 0 {
+			p.Province = s[:bestEnd]
+			s = s[bestEnd:]
 		}
 	}
 
@@ -213,20 +271,29 @@ func earliestSuffixBeforeDigit(s string, suffixes ...string) string {
 	return best
 }
 
-// splitStreetNumberDetail 拆分街道（数字前）、门牌号（数字段）、细节（数字后）
+// splitStreetNumberDetail 拆分街道（数字前）、门牌号（番号序列）、细节（番号后的楼名/房间号）。
+// 番号序列支持 “5丁目12番26号”“5-12-26”“201-118” 等形式，整体提取为 “5-12-26”；
+// 序列之后的数字（如 “318室”）属于细节，不计入门牌号。
 func splitStreetNumberDetail(s string) (street, number, detail string) {
 	loc := numRe.FindStringIndex(s)
 	if loc == nil {
 		return strings.TrimSpace(s), "", ""
 	}
 	street = strings.TrimSpace(s[:loc[0]])
-	number = s[loc[0]:loc[1]]
-	detail = strings.TrimSpace(s[loc[1]:])
+	tail := s[loc[0]:]
+	seq := numSeqRe.FindString(tail)
+	if seq == "" {
+		seq = numRe.FindString(tail)
+	}
+	number = strings.Join(digitGroups(seq), "-")
+	detail = strings.TrimSpace(tail[len(seq):])
 	return
 }
 
-// normalizeAddr 规范化：全角数字转半角、全角空格转半角、连字符统一、压缩空白
+// normalizeAddr 规范化：罗马字番号转日文（5 CHOUME→5丁目）、
+// 全角数字转半角、全角空格转半角、连字符统一、压缩空白
 func normalizeAddr(s string) string {
+	s = normalizeRomajiNumbers(s)
 	var b strings.Builder
 	for _, r := range s {
 		switch {
@@ -241,6 +308,26 @@ func normalizeAddr(s string) string {
 	s = normalizeDashes(b.String())
 	s = spaceRe.ReplaceAllString(s, " ")
 	return strings.TrimSpace(s)
+}
+
+// normalizeRomajiNumbers 将罗马字番号转为日文后缀：
+// “5 CHOUME 12 BAN 26 GOU” -> “5丁目 12番 26号”，“1 JO” -> “1条”
+func normalizeRomajiNumbers(s string) string {
+	return romajiNumRe.ReplaceAllStringFunc(s, func(m string) string {
+		sub := romajiNumRe.FindStringSubmatch(m)
+		suffix, ok := romajiSuffixMap[strings.ToUpper(sub[2])]
+		if !ok {
+			return m
+		}
+		return sub[1] + suffix
+	})
+}
+
+// stripLatinForQuery 去除拉丁字母词（罗马字地名/楼名），GSI 仅索引日文，
+// 罗马字混入查询词会导致召回降级（如 “南が丘町MINAMIGAOKAMACHI 5-12-26” 只命中町名）
+func stripLatinForQuery(s string) string {
+	s = latinWordRe.ReplaceAllString(s, " ")
+	return spaceRe.ReplaceAllString(s, " ")
 }
 
 // normalizeDashes 统一连字符：各类破折号转'-'，数字间的长音符（ー）也转'-'
@@ -302,25 +389,88 @@ func scoreCandidate(p AddressParts, c GSIQueryItem) int {
 	return score
 }
 
-// numberMatchScore 门牌号匹配：全部数字组命中得20，部分命中得10
+// parseKanjiNumber 解析简单汉字数字（1~999）：四→4、十→10、二十四→24、百→100
+func parseKanjiNumber(s string) (int, bool) {
+	total, cur := 0, 0
+	valid := false
+	for _, r := range s {
+		v, ok := kanjiDigitMap[r]
+		if !ok {
+			return 0, false
+		}
+		valid = true
+		switch r {
+		case '百', '十':
+			if cur == 0 {
+				cur = 1
+			}
+			if r == '百' {
+				total += cur * 100
+			} else {
+				total += cur * 10
+			}
+			cur = 0
+		default:
+			cur = v
+		}
+	}
+	return total + cur, valid
+}
+
+// normalizeChomeNumbers 将“四丁目２番”“北一条”等汉字番号转为阿拉伯数字。
+// 仅转换紧跟丁目/番/号等后缀的汉字数字（“四丁目”→“4丁目”），
+// “条”仅限札幌格式（北/南/東/西 + 汉字 + 条），避免误伤“三条市”“一条通”“三鷹”等地名。
+func normalizeChomeNumbers(s string) string {
+	s = chomeNumRe.ReplaceAllStringFunc(s, func(m string) string {
+		sub := chomeNumRe.FindStringSubmatch(m)
+		n, ok := parseKanjiNumber(sub[1])
+		if !ok {
+			return m
+		}
+		return strconv.Itoa(n) + sub[2]
+	})
+	s = sapporoJoRe.ReplaceAllStringFunc(s, func(m string) string {
+		sub := sapporoJoRe.FindStringSubmatch(m)
+		n, ok := parseKanjiNumber(sub[2])
+		if !ok {
+			return m
+		}
+		return sub[1] + strconv.Itoa(n) + "条"
+	})
+	return s
+}
+
+// numberMatchScore 门牌号匹配（日本地址 丁目-番-号 三级）。
+// GSI 数据粒度通常只到“丁目·番”（不含“号”），且番号常用汉字（四丁目、２番），
+// 因此双方先做汉字番号归一，再按层级命中计分：
+//   - 全部数字组命中得 20；
+//   - 首组（丁目）命中且累计命中 ≥2 组（丁目+番）得 20（“号”缺失属数据粒度，不扣分）；
+//   - 部分命中得 10；完全不命中得 0。
 func numberMatchScore(number, title string) int {
-	groups := digitGroups(number)
+	groups := digitGroups(normalizeChomeNumbers(number))
 	if len(groups) == 0 {
 		return 0
 	}
-	hit := 0
-	for _, g := range groups {
-		if strings.Contains(title, g) {
+	nt := normalizeChomeNumbers(title)
+	hit, firstHit := 0, false
+	for i, g := range groups {
+		if strings.Contains(nt, g) {
 			hit++
+			if i == 0 {
+				firstHit = true
+			}
 		}
 	}
-	if hit == len(groups) {
+	switch {
+	case hit == len(groups):
 		return 20
-	}
-	if hit > 0 {
+	case firstHit && hit >= 2:
+		return 20
+	case hit > 0:
 		return 10
+	default:
+		return 0
 	}
-	return 0
 }
 
 // digitGroups 提取数字组："1-12-23" -> ["1","12","23"]
@@ -337,6 +487,16 @@ func cjkOnly(s string) string {
 		}
 	}
 	return b.String()
+}
+
+// hasLatin 是否含有拉丁字母（用于判断纯罗马字地址成分）
+func hasLatin(s string) bool {
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
+			return true
+		}
+	}
+	return false
 }
 
 // isSameAddress 容错比对：非严格字符串相等。
@@ -362,9 +522,14 @@ func isSameAddress(p AddressParts, gsi GSIQueryItem, mode string) AddressCompare
 		tag := "匹配"
 		if !strings.Contains(nGsi, norm) && cjkTolerant {
 			// 容错：混入拉丁字符/数字的街道名，退化为仅中日文字比较
-			if cjk := cjkOnly(part); len([]rune(cjk)) >= 2 && strings.Contains(nGsi, cjk) {
+			cjk := cjkOnly(part)
+			if len([]rune(cjk)) >= 2 && strings.Contains(nGsi, cjk) {
 				norm = cjk
 				tag = "匹配(CJK容错)"
+			} else if cjk == "" && hasLatin(part) {
+				// 纯罗马字成分（如 MINAMIGAOKAMACHI）无法与日文标题比对，记为跳过而非不一致
+				res.Items = append(res.Items, name+":罗马字跳过比对")
+				return false
 			}
 		}
 		if strings.Contains(nGsi, norm) {
