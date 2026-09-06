@@ -33,6 +33,9 @@ var numSeqRe = regexp.MustCompile(`^\s*\d[\d\s]*(?:(?:丁目|番地|地割|番|�
 // 不含“条”（“三条市”是市名）。
 var kanjiNumStartRe = regexp.MustCompile(`[一二三四五六七八九十百]+(?:丁目|番地|地割|号|番)`)
 
+// spacedChomeRe 匹配被空白拆开的“丁 目”（录入时常误加空格，如“３丁 目”）
+var spacedChomeRe = regexp.MustCompile(`丁\s+目`)
+
 // romajiSuffixMap 罗马字番号后缀 -> 日文
 var romajiSuffixMap = map[string]string{
 	"CHOUME": "丁目",
@@ -251,9 +254,13 @@ func splitAddress(raw string) AddressParts {
 	}
 
 	// 3. 街道 / 门牌号 / 细节
-	// 数据录入常把区名重复拼进街道（“緑区ほら貝緑区二丁目”），剥离残留区名避免污染查询
-	if p.District != "" {
-		s = spaceRe.ReplaceAllString(strings.ReplaceAll(s, p.District, " "), " ")
+	// 数据录入常把市/区名重复拼进街道（“南田辺大阪市 東住吉区 3丁目”、
+	// “則松 北九州 八幡西区”“ほら貝緑区二丁目”），剥离残留行政区名避免污染GSI查询。
+	// 同时处理简写重复（北九州市→“北九州”、八幡西区→“八幡西”），简写基底≥3字以防误伤。
+	for _, admin := range []string{p.City, p.District} {
+		for _, name := range adminResidueNames(admin) {
+			s = spaceRe.ReplaceAllString(strings.ReplaceAll(s, name, " "), " ")
+		}
 	}
 	p.Street, p.Number, p.Detail = splitStreetNumberDetail(s)
 	// 町名重复录入折叠（“緑ケ丘 緑ヶ丘”→“緑ヶ丘”），避免重复片段污染GSI查询导致召回降级
@@ -294,6 +301,27 @@ func dedupeStreet(s string) string {
 var townVariantMap = map[rune]rune{
 	'ケ': 'ヶ', 'ヶ': 'ヶ', // 緑ケ丘＝緑ヶ丘（全角片假名/小字片假名）
 	'斉': '斎', '斎': '斎', // 南斉院町＝南斎院町（斎/斉录入混用，GSI标准字形为斎）
+}
+
+// adminResidueNames 返回需从街道中剥离的行政区名形态：
+// 完整名（北九州市）+ 去掉行政后缀的简写（北九州）。
+// 简写基底需≥3个字符（避免“津市→津”“緑区→緑”等短形误伤地名）。
+func adminResidueNames(admin string) []string {
+	admin = strings.TrimSpace(admin)
+	if admin == "" {
+		return nil
+	}
+	names := []string{admin}
+	for _, suf := range []string{"市", "区", "郡", "町", "村"} {
+		if strings.HasSuffix(admin, suf) {
+			base := strings.TrimSuffix(admin, suf)
+			if len([]rune(base)) >= 3 {
+				names = append(names, base)
+			}
+			break
+		}
+	}
+	return names
 }
 
 // canonicalTown 地名归一：异体字/常见别字统一为标准字形，用于重复折叠、查询与比对
@@ -384,6 +412,8 @@ func normalizeAddr(s string) string {
 	}
 	s = normalizeDashes(b.String())
 	s = spaceRe.ReplaceAllString(s, " ")
+	// “丁 目”被录入空格拆开时合并（“３丁 目”→“３丁目”），否则番号序列无法识别
+	s = spacedChomeRe.ReplaceAllString(s, "丁目")
 	// 地名异体字/别字归一（緑ケ丘→緑ヶ丘、南斉院町→南斎院町），查询与比对口径一致
 	s = canonicalTown(s)
 	return strings.TrimSpace(s)
