@@ -6,7 +6,8 @@ type AddressParts struct {
 	City     string `json:"city"`     // 市级（市/郡/特别区）
 	District string `json:"district"` // 区/町/村
 	Street   string `json:"street"`   // 街道/町名
-	Number   string `json:"number"`   // 门牌号
+	Number   string `json:"number"`   // 完整番号
+	Banchi   string `json:"banchi"`   // 番名/番地
 	Detail   string `json:"detail"`   // 楼栋、房间号、公寓名等
 	Raw      string `json:"raw"`      // 原始输入
 }

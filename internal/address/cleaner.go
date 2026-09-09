@@ -36,6 +36,11 @@ var kanjiNumStartRe = regexp.MustCompile(`[一二三四五六七八九十百]+(?
 // spacedChomeRe 匹配被空白拆开的“丁 目”（录入时常误加空格，如“３丁 目”）
 var spacedChomeRe = regexp.MustCompile(`丁\s+目`)
 
+// punctRe 匹配逗号类标点（中英文逗号/顿号）。混合录入地址常用逗号分隔
+// 罗马字重复转写（“砂川町 Sunagawacho, Tachikawa”），残留进查询词会降级
+// GSI 召回（町级），统一转为空格。
+var punctRe = regexp.MustCompile("[,，、]")
+
 // romajiSuffixMap 罗马字番号后缀 -> 日文
 var romajiSuffixMap = map[string]string{
 	"CHOUME": "丁目",
@@ -101,7 +106,12 @@ func (ac *AddressCleaner) Clean(ctx context.Context, input string, opt CleanOpti
 	res.Matched = matched
 	if matched != nil {
 		res.GSIAddress = matched.Title
-		cmp := isSameAddress(res.Parts, *matched, opt.Mode)
+		// 市名叠字折叠：解析为保「市原市/四日市市」正确性会产出 City=宇治市市，
+		// 若折叠形态命中 GSI 标题，则以官方市名参与比对与输出
+		if c := collapseDoubleShi(res.Parts.City); c != res.Parts.City && strings.Contains(normalizeAddr(matched.Title), normalizeAddr(c)) {
+			res.Parts.City = c
+		}
+		cmp := isSameAddress(res.Parts, *matched, items, opt.Mode)
 		res.Compare = &cmp
 	}
 	res.Validation = ac.buildValidation(res, bestScore, opt)
@@ -143,8 +153,11 @@ func buildQueryVariants(p AddressParts) []string {
 	// GSI 索引仅含日文，罗马字（地名/楼名/番号）会降级召回，查询词统一去除拉丁词
 	variants := []string{
 		stripLatinForQuery(composeQuery(p, true)),
+		// 市名叠字容错：「宇治市市妙楽」折叠为「宇治市妙楽」再查
+		stripLatinForQuery(collapseDoubleShi(composeQuery(p, true))),
 		stripLatinForQuery(normalizeAddr(p.Raw)),
 		stripLatinForQuery(composeQuery(p, false)),
+		stripLatinForQuery(collapseDoubleShi(composeQuery(p, false))),
 		p.Province + p.City + p.District,
 		p.Province + p.City,
 	}
@@ -239,8 +252,9 @@ func splitAddress(raw string) AddressParts {
 		}
 	}
 
-	// 2. 市级（市/郡），随后接区/町/村级
-	if city := earliestSuffixBeforeDigit(s, "市", "郡"); city != "" {
+	// 2. 市级（市/郡），随后接区/町/村级。
+	// 市名自身可含“市”（市原市/四日市市/市川市），取第一个核心非空且非叠字的市/郡边界。
+	if city := cityBoundaryBeforeDigit(s, "市", "郡"); city != "" {
 		p.City = city
 		s = strings.TrimPrefix(s, city)
 		if d := earliestSuffixBeforeDigit(s, "区", "町", "村"); d != "" {
@@ -263,8 +277,12 @@ func splitAddress(raw string) AddressParts {
 		}
 	}
 	p.Street, p.Number, p.Detail = splitStreetNumberDetail(s)
+	p.Banchi = extractBanchi(p.Number)
 	// 町名重复录入折叠（“緑ケ丘 緑ヶ丘”→“緑ヶ丘”），避免重复片段污染GSI查询导致召回降级
 	p.Street = dedupeStreet(p.Street)
+	// 罗马字重复转写折叠：“砂川町 Sunagawacho, Tachikawa”中街道仅剩罗马字词，
+	// 是已提取日文町名/市名的转写，剔除避免污染输出与比对
+	p.Street = foldRomajiStreet(p.Street, p.District)
 	// 跨字段重复：町名已在区/町村字段提取，街道中又残留一遍（常为别字异体，
 	// 如“南斎院町”入district、“南斉院町”留在street），清空街道重复避免污染查询
 	if p.District != "" && p.Street != "" && canonicalTown(p.District) == canonicalTown(p.Street) {
@@ -295,6 +313,44 @@ func dedupeStreet(s string) string {
 		}
 	}
 	return strings.TrimSpace(s)
+}
+
+// foldRomajiStreet 折叠街道中纯拉丁词（罗马字重复转写）。日文町名已入 district 时，
+// 街道里的纯拉丁词（“Sunagawacho”“Tachikawa”）是同一地名的罗马字转写：
+// GSI 查询本就剔除拉丁词、比对也跳过纯罗马字成分，保留只会污染输出，故剔除。
+// 混合词（如“ABCビル”）含日文信息，保留；无日文町名提取时（district为空）不动，
+// 避免“MINAMIGAOKAMACHI 5-12-26”这类纯罗马字町名输入丢失唯一地名信息。
+func foldRomajiStreet(street, district string) string {
+	if district == "" || street == "" || !hasLatin(street) {
+		return street
+	}
+	tokens := strings.Fields(street)
+	out := make([]string, 0, len(tokens))
+	dropped := false
+	for _, t := range tokens {
+		if isLatinWord(t) {
+			dropped = true
+			continue
+		}
+		out = append(out, t)
+	}
+	if !dropped {
+		return street
+	}
+	return strings.Join(out, " ")
+}
+
+// isLatinWord 词元是否为纯拉丁字母词（罗马字转写词元）
+func isLatinWord(t string) bool {
+	if t == "" {
+		return false
+	}
+	for _, r := range t {
+		if (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') {
+			return false
+		}
+	}
+	return true
 }
 
 // townVariantMap 地名异体字/常见录入别字归一（映射到GSI采用的标准字形）
@@ -356,6 +412,42 @@ func earliestSuffixBeforeDigit(s string, suffixes ...string) string {
 	return best
 }
 
+// cityBoundaryBeforeDigit 在第一个数字之前，定位市级（市/郡）边界并返回含后缀的完整片段。
+// 规则：取第一个“核心非空（后缀前至少1字）、且后面不紧跟同一后缀字”的后缀位置。
+// 这样既处理市名自身含“市”的市原市/四日市市/市川市（“四日市+市”中的第一个市后紧跟市，
+// 属于市名组成字需跳过），又不会把街道里重复出现的市名（“…南田辺大阪市…”）吸进市级。
+func cityBoundaryBeforeDigit(s string, suffixes ...string) string {
+	limit := len(s)
+	if loc := numRe.FindStringIndex(s); loc != nil && loc[0] < limit {
+		limit = loc[0]
+	}
+	region := s[:limit]
+	bestEnd := -1
+	for _, suf := range suffixes {
+		searchStart := 0
+		for {
+			rel := strings.Index(region[searchStart:], suf)
+			if rel < 0 {
+				break
+			}
+			idx := searchStart + rel
+			after := idx + len(suf)
+			// 核心非空，且不是“市市/郡郡”叠字（叠字时前一个后缀是市名组成字）
+			if idx >= 1 && (after >= len(region) || !strings.HasPrefix(region[after:], suf)) {
+				if bestEnd == -1 || after < bestEnd {
+					bestEnd = after
+				}
+				break // 该后缀取第一个合格位置
+			}
+			searchStart = after
+		}
+	}
+	if bestEnd < 0 {
+		return ""
+	}
+	return region[:bestEnd]
+}
+
 // splitStreetNumberDetail 拆分街道（数字前）、门牌号（番号序列）、细节（番号后的楼名/房间号）。
 // 番号序列支持 “5丁目12番26号”“二丁目98番”“5-12-26”“201-118” 等形式，整体提取为 “5-12-26”；
 // 序列之后的内容（如 “池”“318室”）属于细节，不计入门牌号。
@@ -374,6 +466,19 @@ func splitStreetNumberDetail(s string) (street, number, detail string) {
 	number = strings.Join(digitGroups(seq), "-")
 	detail = strings.TrimSpace(tail[len(seq):])
 	return
+}
+
+// extractBanchi 提取番号中的番名（番/番地对应的数字组）。
+// 三组番号按“丁目-番-号”取第二组；两组或一组番号按“番-号”或“番地”取第一组。
+func extractBanchi(number string) string {
+	groups := digitGroups(number)
+	if len(groups) == 0 {
+		return ""
+	}
+	if len(groups) >= 3 {
+		return groups[1]
+	}
+	return groups[0]
 }
 
 // numberSeqStart 返回番号序列的起始字节位置：
@@ -411,6 +516,8 @@ func normalizeAddr(s string) string {
 		}
 	}
 	s = normalizeDashes(b.String())
+	// 逗号类标点转空格（“Sunagawacho, Tachikawa”），避免残留进GSI查询词
+	s = punctRe.ReplaceAllString(s, " ")
 	s = spaceRe.ReplaceAllString(s, " ")
 	// “丁 目”被录入空格拆开时合并（“３丁 目”→“３丁目”），否则番号序列无法识别
 	s = spacedChomeRe.ReplaceAllString(s, "丁目")
@@ -437,6 +544,13 @@ func normalizeRomajiNumbers(s string) string {
 func stripLatinForQuery(s string) string {
 	s = latinWordRe.ReplaceAllString(s, " ")
 	return spaceRe.ReplaceAllString(s, " ")
+}
+
+// collapseDoubleShi 折叠重复的“市”字：「宇治市市妙楽」→「宇治市妙楽」。
+// 市名叠字规则（服务 市原市/四日市市）会把「宇治市市妙楽」解析出 City=宇治市市，
+// 而官方市名无叠字，查询与比对时用折叠形态容错。
+func collapseDoubleShi(s string) string {
+	return strings.ReplaceAll(s, "市市", "市")
 }
 
 // normalizeDashes 统一连字符：各类破折号转'-'，数字间的长音符（ー）也转'-'
@@ -484,6 +598,9 @@ func scoreCandidate(p AddressParts, c GSIQueryItem) int {
 		score += 30
 	}
 	if p.City != "" && strings.Contains(title, normalizeAddr(p.City)) {
+		score += 30
+	} else if c := collapseDoubleShi(normalizeAddr(p.City)); c != "" && c != normalizeAddr(p.City) && strings.Contains(title, c) {
+		// 市名叠字折叠容错（City=宇治市市 → 宇治市）
 		score += 30
 	}
 	if p.District != "" && strings.Contains(title, normalizeAddr(p.District)) {
@@ -611,7 +728,8 @@ func hasLatin(s string) bool {
 // isSameAddress 容错比对：非严格字符串相等。
 // 容错范围：全角/半角、连字符、空白、表述差异。
 // 核心条件：城市命中 且（街道 或 门牌）命中，再按模式阈值判定。
-func isSameAddress(p AddressParts, gsi GSIQueryItem, mode string) AddressCompareResult {
+// candidates 为全部 GSI 候选，用于判断町名是否可核验（GSI粒度容错）。
+func isSameAddress(p AddressParts, gsi GSIQueryItem, candidates []GSIQueryItem, mode string) AddressCompareResult {
 	res := AddressCompareResult{Items: []string{}}
 	nIn := normalizeAddr(p.Raw)
 	nGsi := normalizeAddr(gsi.Title)
@@ -652,8 +770,23 @@ func isSameAddress(p AddressParts, gsi GSIQueryItem, mode string) AddressCompare
 
 	match("province", p.Province, 20, false)
 	cityOK = match("city", p.City, 25, false)
+	if !cityOK {
+		// 市名叠字折叠容错：City=宇治市市 折叠为 宇治市 后可命中官方标题
+		if c := collapseDoubleShi(normalizeAddr(p.City)); c != "" && c != normalizeAddr(p.City) && strings.Contains(nGsi, c) {
+			cityOK = true
+			score += 25
+			res.Items = append(res.Items, "city:匹配(市重字折叠容错)")
+		}
+	}
 	districtOK = match("district", p.District, 15, false)
-	streetOK = match("street", p.Street, 15, true)
+	// 町名可核验性：任一候选含町名才可比对；GSI 仅返回市级（町名缺大字前缀等
+	// 导致召不回町级）时，町名属于无法核验而非不一致
+	streetVerifiable := p.Street == "" || streetVerifiableIn(p, candidates)
+	if p.Street == "" || streetVerifiable {
+		streetOK = match("street", p.Street, 15, true)
+	} else {
+		res.Items = append(res.Items, "street:GSI未含町名，无法核验")
+	}
 
 	// 容错：GSI标题常省略“郡”（如“賀茂郡松崎町”→“静岡県松崎町”），
 	// 若市为郡级且区町村已命中，则视为市级命中
@@ -676,15 +809,20 @@ func isSameAddress(p AddressParts, gsi GSIQueryItem, mode string) AddressCompare
 		}
 	}
 
-	// 街道为空（如“〇〇町1740-9”形式）时不阻断核心匹配，由区町村/门牌兜底
-	core := cityOK && (p.Street == "" || streetOK || numScore > 0)
+	// 街道为空（如“〇〇町1740-9”形式）时不阻断核心匹配，由区町村/门牌兜底；
+	// 町名无法核验（GSI仅到市级）时同样不阻断，由市级+阈值降权兜底
+	core := cityOK && (p.Street == "" || streetOK || !streetVerifiable || numScore > 0)
 
 	threshold := 80
 	if mode == "relaxed" {
 		threshold = 60
 	}
-	// 番号不可验证（输入无番号，或GSI仅到町名）时，番号权重不计入门槛
+	// 番号不可验证（输入无番号，或GSI标题无数字）时，番号权重不计入门槛
 	if p.Number == "" || !numVerifiable {
+		threshold -= 20
+	}
+	// 町名不可核验（GSI仅到市级）时，街道权重不计入门槛
+	if !streetVerifiable {
 		threshold -= 20
 	}
 	res.Score = score
@@ -698,6 +836,22 @@ func isSameAddress(p AddressParts, gsi GSIQueryItem, mode string) AddressCompare
 		res.Reason = "核心成分不匹配（需同时命中城市与街道/门牌）"
 	}
 	return res
+}
+
+// streetVerifiableIn 町名是否可核验：任一候选标题（归一后）包含町名。
+// GSI 仅返回市级（町名召不回，如「宇治妙楽」被写成「市妙楽」缺大字前缀）时
+// 町名无法核验，比对按数据粒度容错处理，而非判为町名不一致。
+func streetVerifiableIn(p AddressParts, items []GSIQueryItem) bool {
+	ns := normalizeAddr(p.Street)
+	if ns == "" {
+		return true
+	}
+	for i := range items {
+		if strings.Contains(normalizeAddr(items[i].Title), ns) {
+			return true
+		}
+	}
+	return false
 }
 
 // buildValidation 汇总校验结论；低置信度且开启AI时用AI复核（AI失败回退规则结论）
@@ -727,6 +881,13 @@ func (ac *AddressCleaner) buildValidation(res *CleanResult, bestScore int, opt C
 		v.Confidence = "low"
 	}
 
+	// GSI 数据粒度不足（町名/番号无法核验）时同步下调判定门槛，与比对层口径一致
+	if res.Parts.Street != "" && !streetVerifiableIn(res.Parts, res.Candidates) {
+		threshold -= 20
+	}
+	if res.Parts.Number == "" || !numRe.MatchString(res.Compare.NormalizedGSI) {
+		threshold -= 20
+	}
 	v.IsValid = v.Same && bestScore >= threshold
 
 	// 中/低置信度且开启AI时用AI复核（边界案例最容易误判）；AI失败回退规则结论
